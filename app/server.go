@@ -10,6 +10,21 @@ import (
 var _ = net.Listen
 var _ = os.Exit
 
+func handle(conn net.Conn) error {
+	req := make([]byte, 1024)
+	if _, err := conn.Read(req); err != nil {
+		return err
+	}
+
+	resp := make([]byte, 8)
+	copy(resp[4:], req[8:12])
+	if _, err := conn.Write(resp); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here!")
@@ -26,14 +41,8 @@ func main() {
 	}
 	defer conn.Close()
 
-	if _, err := conn.Read(make([]byte, 1024)); err != nil {
-		fmt.Println("Error while reading request: ", err.Error())
-		os.Exit(1)
-	}
-
-	resp := []byte{0, 0, 0, 0, 0, 0, 0, 7}
-	if _, err := conn.Write(resp); err != nil {
-		fmt.Println("Error while responding: ", err.Error())
+	if err := handle(conn); err != nil {
+		fmt.Println("Error while handling request: ", err.Error())
 		os.Exit(1)
 	}
 }
