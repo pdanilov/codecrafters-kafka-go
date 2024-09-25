@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -10,15 +12,81 @@ import (
 var _ = net.Listen
 var _ = os.Exit
 
-func handle(conn net.Conn) error {
-	req := make([]byte, 1024)
-	if _, err := conn.Read(req); err != nil {
+var (
+	ErrInvalidApiVersion = errors.New("Invalid API Version")
+)
+
+type KafkaConn net.Conn
+
+type KafkaRequest struct {
+	Length        int32
+	ApiKey        int16
+	ApiVersion    int16
+	CorrelationId int32
+}
+
+func (r *KafkaRequest) ValidateApiversion() error {
+	switch r.ApiVersion {
+	case 0, 1, 2, 3, 4:
+		return nil
+	default:
+		return fmt.Errorf("%w: %d", ErrInvalidApiVersion, r.ApiVersion)
+	}
+}
+
+func NewKafkaRequestFromBytes(b []byte) *KafkaRequest {
+	r := &KafkaRequest{
+		Length:        int32(binary.BigEndian.Uint32(b[:4])),
+		ApiKey:        int16(binary.BigEndian.Uint16(b[4:6])),
+		ApiVersion:    int16(binary.BigEndian.Uint16(b[6:8])),
+		CorrelationId: int32(binary.BigEndian.Uint32(b[8:12])),
+	}
+
+	return r
+}
+
+type KafkaResponse struct {
+	Length        int32
+	CorrelationId int32
+	ErrorCode     int16
+}
+
+func NewKafkaResponse(len int32, correlationId int32, errCode int16) *KafkaResponse {
+	r := &KafkaResponse{
+		Length:        len,
+		CorrelationId: correlationId,
+		ErrorCode:     errCode,
+	}
+
+	return r
+}
+
+func (r *KafkaResponse) Bytes() []byte {
+	b := make([]byte, 0)
+	b = binary.BigEndian.AppendUint32(b, uint32(r.Length))
+	b = binary.BigEndian.AppendUint32(b, uint32(r.CorrelationId))
+	b = binary.BigEndian.AppendUint16(b, uint16(r.ErrorCode))
+	return b
+}
+
+func handle(conn KafkaConn) error {
+	reqb := make([]byte, 1024)
+	if _, err := conn.Read(reqb); err != nil {
 		return err
 	}
 
-	resp := make([]byte, 8)
-	copy(resp[4:], req[8:12])
-	if _, err := conn.Write(resp); err != nil {
+	req := NewKafkaRequestFromBytes(reqb)
+	var errCode int16
+	if err := req.ValidateApiversion(); err != nil {
+		if errors.Is(err, ErrInvalidApiVersion) {
+			errCode = 35
+		} else {
+			return err
+		}
+	}
+
+	resp := NewKafkaResponse(0, req.CorrelationId, errCode)
+	if _, err := conn.Write(resp.Bytes()); err != nil {
 		return err
 	}
 
