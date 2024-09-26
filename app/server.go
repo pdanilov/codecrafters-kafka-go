@@ -2,21 +2,21 @@ package main
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 )
 
 // Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
 var _ = net.Listen
 var _ = os.Exit
 
-var (
-	ErrInvalidApiVersion = errors.New("Invalid API Version")
-)
-
 type KafkaConn net.Conn
+
+var (
+	CodeInvalidApiVersion = 35
+)
 
 type KafkaRequest struct {
 	Length        int32
@@ -25,35 +25,56 @@ type KafkaRequest struct {
 	CorrelationId int32
 }
 
-func (r *KafkaRequest) ValidateApiversion() error {
+func (r *KafkaRequest) Validate() int16 {
 	switch r.ApiVersion {
 	case 0, 1, 2, 3, 4:
-		return nil
+		return 0
 	default:
-		return fmt.Errorf("%w: %d", ErrInvalidApiVersion, r.ApiVersion)
+		return int16(CodeInvalidApiVersion)
 	}
 }
 
-func NewKafkaRequestFromBytes(b []byte) *KafkaRequest {
-	r := &KafkaRequest{
-		Length:        int32(binary.BigEndian.Uint32(b[:4])),
-		ApiKey:        int16(binary.BigEndian.Uint16(b[4:6])),
-		ApiVersion:    int16(binary.BigEndian.Uint16(b[6:8])),
-		CorrelationId: int32(binary.BigEndian.Uint32(b[8:12])),
+func NewKafkaRequest(conn KafkaConn) (*KafkaRequest, error) {
+	r := &KafkaRequest{}
+	vs := []any{&r.Length, &r.ApiKey, &r.ApiVersion, &r.CorrelationId}
+	var n int
+	for i, v := range vs {
+		err := binary.Read(conn, binary.BigEndian, v)
+		if err != nil {
+			return nil, err
+		}
+
+		if i > 0 {
+			n += int(reflect.TypeOf(v).Elem().Size())
+		}
 	}
 
-	return r
+	b := make([]byte, int(r.Length)-n)
+	if _, err := conn.Read(b); err != nil {
+		return nil, err
+	}
+
+	return r, nil
+}
+
+type ApiKey struct {
+	Key        int16
+	MinVersion int16
+	MaxVersion int16
 }
 
 type KafkaResponse struct {
 	Length        int32
 	CorrelationId int32
 	ErrorCode     int16
+	NumOfApiKeys  int8
+	ApiKeys       []ApiKey
+	ThrottleTime  int32
 }
 
-func NewKafkaResponse(len int32, correlationId int32, errCode int16) *KafkaResponse {
+func NewKafkaResponseShort(correlationId int32, errCode int16) *KafkaResponse {
 	r := &KafkaResponse{
-		Length:        len,
+		Length:        int32(reflect.TypeOf(correlationId).Size() + reflect.TypeOf(errCode).Size()),
 		CorrelationId: correlationId,
 		ErrorCode:     errCode,
 	}
@@ -61,32 +82,78 @@ func NewKafkaResponse(len int32, correlationId int32, errCode int16) *KafkaRespo
 	return r
 }
 
-func (r *KafkaResponse) Bytes() []byte {
-	b := make([]byte, 0)
-	b = binary.BigEndian.AppendUint32(b, uint32(r.Length))
-	b = binary.BigEndian.AppendUint32(b, uint32(r.CorrelationId))
-	b = binary.BigEndian.AppendUint16(b, uint16(r.ErrorCode))
-	return b
-}
+func NewKafkaResponse(correlationId int32, errCode int16, apiKeys []ApiKey, throttleTime int32) *KafkaResponse {
+	numOfApiKeys := int8(len(apiKeys))
+	length := int32(
+		reflect.TypeOf(correlationId).Size() +
+			reflect.TypeOf(errCode).Size() +
+			reflect.TypeOf(numOfApiKeys).Size(),
+	)
 
-func handle(conn KafkaConn) error {
-	reqb := make([]byte, 1024)
-	if _, err := conn.Read(reqb); err != nil {
-		return err
+	for _, key := range apiKeys {
+		length += int32(
+			reflect.TypeOf(key.Key).Size() +
+				reflect.TypeOf(key.MinVersion).Size() +
+				reflect.TypeOf(key.MaxVersion).Size() +
+				1, // TAG_BUFFER
+		)
 	}
 
-	req := NewKafkaRequestFromBytes(reqb)
-	var errCode int16
-	if err := req.ValidateApiversion(); err != nil {
-		if errors.Is(err, ErrInvalidApiVersion) {
-			errCode = 35
-		} else {
+	length += int32(
+		reflect.TypeOf(throttleTime).Size() +
+			1, // TAG_BUFFER
+	)
+
+	r := &KafkaResponse{
+		Length:        length,
+		CorrelationId: correlationId,
+		ErrorCode:     errCode,
+		NumOfApiKeys:  numOfApiKeys + 1, // I don't know why do we need +1, it's from code examples
+		ApiKeys:       apiKeys,
+		ThrottleTime:  throttleTime,
+	}
+
+	return r
+}
+
+func (r *KafkaResponse) Write(conn KafkaConn) error {
+	for _, v := range []any{r.Length, r.CorrelationId, r.ErrorCode, r.NumOfApiKeys} {
+		err := binary.Write(conn, binary.BigEndian, v)
+		if err != nil {
 			return err
 		}
 	}
 
-	resp := NewKafkaResponse(0, req.CorrelationId, errCode)
-	if _, err := conn.Write(resp.Bytes()); err != nil {
+	for _, key := range r.ApiKeys {
+		for _, v := range []any{key.Key, key.MinVersion, key.MaxVersion, []byte{0}} {
+			err := binary.Write(conn, binary.BigEndian, v)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, v := range []any{r.ThrottleTime, []byte{0}} {
+		err := binary.Write(conn, binary.BigEndian, v)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func Handle(conn KafkaConn) error {
+	req, err := NewKafkaRequest(conn)
+	if err != nil {
+		return err
+	}
+
+	var resp *KafkaResponse
+	code := req.Validate()
+	resp = NewKafkaResponse(req.CorrelationId, code, []ApiKey{{Key: 18, MinVersion: 1, MaxVersion: 4}}, 0)
+
+	if err := resp.Write(conn); err != nil {
 		return err
 	}
 
@@ -109,7 +176,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	if err := handle(conn); err != nil {
+	if err := Handle(conn); err != nil {
 		fmt.Println("Error while handling request: ", err.Error())
 		os.Exit(1)
 	}
