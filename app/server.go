@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
 	"reflect"
+	"time"
 )
 
 // Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
@@ -34,7 +36,13 @@ func (r *KafkaRequest) Validate() int16 {
 	}
 }
 
-func NewKafkaRequest(conn KafkaConn) (*KafkaRequest, error) {
+func NewKafkaRequest(ctx context.Context, conn KafkaConn) (*KafkaRequest, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			return nil, err
+		}
+	}
+
 	r := &KafkaRequest{}
 	vs := []any{&r.Length, &r.ApiKey, &r.ApiVersion, &r.CorrelationId}
 	var n int
@@ -72,16 +80,6 @@ type KafkaResponse struct {
 	ThrottleTime  int32
 }
 
-func NewKafkaResponseShort(correlationId int32, errCode int16) *KafkaResponse {
-	r := &KafkaResponse{
-		Length:        int32(reflect.TypeOf(correlationId).Size() + reflect.TypeOf(errCode).Size()),
-		CorrelationId: correlationId,
-		ErrorCode:     errCode,
-	}
-
-	return r
-}
-
 func NewKafkaResponse(correlationId int32, errCode int16, apiKeys []ApiKey, throttleTime int32) *KafkaResponse {
 	numOfApiKeys := int8(len(apiKeys))
 	length := int32(
@@ -116,7 +114,13 @@ func NewKafkaResponse(correlationId int32, errCode int16, apiKeys []ApiKey, thro
 	return r
 }
 
-func (r *KafkaResponse) Write(conn KafkaConn) error {
+func (r *KafkaResponse) Write(ctx context.Context, conn KafkaConn) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetWriteDeadline(deadline); err != nil {
+			return err
+		}
+	}
+
 	for _, v := range []any{r.Length, r.CorrelationId, r.ErrorCode, r.NumOfApiKeys} {
 		err := binary.Write(conn, binary.BigEndian, v)
 		if err != nil {
@@ -143,8 +147,8 @@ func (r *KafkaResponse) Write(conn KafkaConn) error {
 	return nil
 }
 
-func Handle(conn KafkaConn) error {
-	req, err := NewKafkaRequest(conn)
+func Handle(ctx context.Context, conn KafkaConn) error {
+	req, err := NewKafkaRequest(ctx, conn)
 	if err != nil {
 		return err
 	}
@@ -153,11 +157,24 @@ func Handle(conn KafkaConn) error {
 	code := req.Validate()
 	resp = NewKafkaResponse(req.CorrelationId, code, []ApiKey{{Key: 18, MinVersion: 1, MaxVersion: 4}}, 0)
 
-	if err := resp.Write(conn); err != nil {
+	if err := resp.Write(ctx, conn); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func HandleLoop(conn KafkaConn) error {
+	for {
+		err := func() error {
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(5*time.Second))
+			defer cancel()
+			return Handle(ctx, conn)
+		}()
+		if err != nil {
+			return err
+		}
+	}
 }
 
 func main() {
@@ -176,7 +193,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	if err := Handle(conn); err != nil {
+	if err := HandleLoop(conn); err != nil {
 		fmt.Println("Error while handling request: ", err.Error())
 		os.Exit(1)
 	}
