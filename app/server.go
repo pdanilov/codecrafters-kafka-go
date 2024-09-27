@@ -8,11 +8,9 @@ import (
 	"os"
 	"reflect"
 	"time"
-)
 
-// Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
-var _ = net.Listen
-var _ = os.Exit
+	"golang.org/x/sync/errgroup"
+)
 
 type KafkaConn net.Conn
 
@@ -164,37 +162,58 @@ func Handle(ctx context.Context, conn KafkaConn) error {
 	return nil
 }
 
-func HandleLoop(conn KafkaConn) error {
+func HandleLoop(ctx context.Context, conn KafkaConn) error {
 	for {
 		err := func() error {
-			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(5*time.Second))
+			ctx, cancel := context.WithDeadline(ctx, time.Now().Add(5*time.Second))
 			defer cancel()
 			return Handle(ctx, conn)
 		}()
+
 		if err != nil {
 			return err
 		}
 	}
 }
 
-func main() {
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
-	fmt.Println("Logs from your program will appear here!")
+func HandleMultiConn(l net.Listener) error {
+	g, ctx := errgroup.WithContext(context.Background())
 
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			break loop
+		default:
+			g.Go(func() error {
+				conn, err := l.Accept()
+				if err != nil {
+					return fmt.Errorf("Error accepting connection: %w", err)
+				}
+				defer conn.Close()
+
+				if err := HandleLoop(ctx, conn); err != nil {
+					return fmt.Errorf("Error while handling request: %w", err)
+				}
+
+				return nil
+			})
+		}
+	}
+
+	return g.Wait()
+}
+
+func main() {
 	l, err := net.Listen("tcp", "0.0.0.0:9092")
 	if err != nil {
 		fmt.Println("Failed to bind to port 9092")
 		os.Exit(1)
 	}
-	conn, err := l.Accept()
-	if err != nil {
-		fmt.Println("Error accepting connection: ", err.Error())
-		os.Exit(1)
-	}
-	defer conn.Close()
+	defer l.Close()
 
-	if err := HandleLoop(conn); err != nil {
-		fmt.Println("Error while handling request: ", err.Error())
+	if err := HandleMultiConn(l); err != nil {
+		fmt.Println(err.Error())
 		os.Exit(1)
 	}
 }
