@@ -10,4 +10,4 @@ module github.com/codecrafters-io/kafka-starter-go
 
 go 1.22
 
-require golang.org/x/sync v0.8.0 // indirect
+require golang.org/x/sync v0.8.0
