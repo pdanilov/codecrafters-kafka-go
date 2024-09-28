@@ -38,6 +38,11 @@ type ApiKey struct {
 	MaxVersion int16
 }
 
+var (
+	Fetch       = ApiKey{Key: 1, MinVersion: 1, MaxVersion: 16}
+	ApiVersions = ApiKey{Key: 18, MinVersion: 1, MaxVersion: 4}
+)
+
 type KafkaResponse struct {
 	Length        int32
 	CorrelationId int32
@@ -161,7 +166,7 @@ func (conn *KafkaConn) Handle(ctx context.Context) error {
 		return nil
 	}
 
-	resp := NewKafkaResponse(req.CorrelationId, req.Validate(), []ApiKey{{Key: 18, MinVersion: 1, MaxVersion: 4}}, 0)
+	resp := NewKafkaResponse(req.CorrelationId, req.Validate(), []ApiKey{Fetch, ApiVersions}, 0)
 	if err := conn.Response(ctx, resp); err != nil {
 		return err
 	}
