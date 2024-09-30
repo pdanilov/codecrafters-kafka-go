@@ -1,9 +1,12 @@
 package kafka
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"reflect"
 	"time"
@@ -12,100 +15,51 @@ import (
 )
 
 var (
-	CodeInvalidApiVersion = 35
+	ErrUnsupportedApiKey = errors.New("Unsupported api key")
 )
 
-type KafkaRequest struct {
-	Length        int32
-	ApiKey        int16
-	ApiVersion    int16
-	CorrelationId int32
-	Body          []byte
-}
-
-func (req *KafkaRequest) Validate() int16 {
-	switch req.ApiVersion {
-	case 0, 1, 2, 3, 4:
-		return 0
-	default:
-		return int16(CodeInvalidApiVersion)
-	}
-}
-
-type ApiKey struct {
-	Key        int16
-	MinVersion int16
-	MaxVersion int16
-}
-
-var (
-	Fetch       = ApiKey{Key: 1, MinVersion: 1, MaxVersion: 16}
-	ApiVersions = ApiKey{Key: 18, MinVersion: 1, MaxVersion: 4}
+const (
+	TagBuffer        int8  = 0
+	ThrottleTimeMock int32 = 0
 )
 
-type KafkaResponse struct {
-	Length        int32
-	CorrelationId int32
-	ErrorCode     int16
-	NumOfApiKeys  int8
-	ApiKeys       []ApiKey
-	ThrottleTime  int32
-}
-
-func NewKafkaResponse(correlationId int32, errCode int16, apiKeys []ApiKey, throttleTime int32) *KafkaResponse {
-	numOfApiKeys := int8(len(apiKeys))
-	length := int32(
-		reflect.TypeOf(correlationId).Size() +
-			reflect.TypeOf(errCode).Size() +
-			reflect.TypeOf(numOfApiKeys).Size(),
-	)
-
-	for _, key := range apiKeys {
-		length += int32(
-			reflect.TypeOf(key.Key).Size() +
-				reflect.TypeOf(key.MinVersion).Size() +
-				reflect.TypeOf(key.MaxVersion).Size() +
-				1, // TAG_BUFFER
-		)
+func WriteMany(w io.Writer, data ...any) error {
+	for _, v := range data {
+		err := binary.Write(w, binary.BigEndian, v)
+		if err != nil {
+			return err
+		}
 	}
 
-	length += int32(
-		reflect.TypeOf(throttleTime).Size() +
-			1, // TAG_BUFFER
-	)
-
-	r := &KafkaResponse{
-		Length:        length,
-		CorrelationId: correlationId,
-		ErrorCode:     errCode,
-		NumOfApiKeys:  numOfApiKeys + 1, // I don't know why do we need +1, it's from code examples
-		ApiKeys:       apiKeys,
-		ThrottleTime:  throttleTime,
-	}
-
-	return r
+	return nil
 }
 
 type KafkaConn struct {
 	net.Conn
+	buf *bytes.Buffer
 }
 
 func NewKafkaConn(conn net.Conn) *KafkaConn {
-	return &KafkaConn{Conn: conn}
+	return &KafkaConn{Conn: conn, buf: bytes.NewBuffer(nil)}
+}
+
+func (conn *KafkaConn) Flush() error {
+	defer conn.buf.Reset()
+	return WriteMany(conn, int32(conn.buf.Len()), conn.buf.Bytes())
 }
 
 func (conn *KafkaConn) Close() error {
 	return conn.Conn.Close()
 }
 
-func (conn *KafkaConn) Request(ctx context.Context) (*KafkaRequest, error) {
+func (conn *KafkaConn) ParseRequest(ctx context.Context) (*Request, error) {
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetReadDeadline(deadline); err != nil {
 			return nil, err
 		}
 	}
 
-	req := &KafkaRequest{}
+	req := &Request{}
 	vs := []any{&req.Length, &req.ApiKey, &req.ApiVersion, &req.CorrelationId}
 	var n int
 	for i, v := range vs {
@@ -127,51 +81,96 @@ func (conn *KafkaConn) Request(ctx context.Context) (*KafkaRequest, error) {
 	return req, nil
 }
 
-func (conn *KafkaConn) Response(ctx context.Context, resp *KafkaResponse) error {
+// ApiVersions Response (Version: CodeCrafters) => error_code num_of_api_keys [api_keys] throttle_time_ms TAG_BUFFER
+// error_code => INT16
+// num_of_api_keys => INT8
+// api_keys => api_key min_version max_version
+//
+//	api_key => INT16
+//	min_version => INT16
+//	max_version => INT16
+//	_tagged_fields
+//
+// throttle_time_ms => INT32
+// _tagged_fields
+func (conn *KafkaConn) HandleApiVersionsRequest(ctx context.Context, req *Request) error {
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetWriteDeadline(deadline); err != nil {
 			return err
 		}
 	}
 
-	for _, v := range []any{resp.Length, resp.CorrelationId, resp.ErrorCode, resp.NumOfApiKeys} {
-		err := binary.Write(conn, binary.BigEndian, v)
+	errCode := req.Validate()
+	apiKeys := []ApiKey{ApiKeyFetch, ApiKeyApiVersions}
+	numOfApiKeys := int8(len(apiKeys) + 1)
+	if err := WriteMany(conn.buf, req.CorrelationId, errCode, numOfApiKeys); err != nil {
+		return err
+	}
+
+	for _, key := range apiKeys {
+		vrange, err := key.VersionRange()
 		if err != nil {
+			return err
+		}
+
+		if err := WriteMany(conn.buf, key, vrange.Min, vrange.Max, TagBuffer); err != nil {
 			return err
 		}
 	}
 
-	for _, key := range resp.ApiKeys {
-		for _, v := range []any{key.Key, key.MinVersion, key.MaxVersion, []byte{0}} {
-			err := binary.Write(conn, binary.BigEndian, v)
-			if err != nil {
-				return err
-			}
-		}
+	if err := WriteMany(conn.buf, ThrottleTimeMock, TagBuffer); err != nil {
+		return err
 	}
 
-	for _, v := range []any{resp.ThrottleTime, []byte{0}} {
-		err := binary.Write(conn, binary.BigEndian, v)
-		if err != nil {
-			return err
-		}
+	return conn.Flush()
+}
+
+// Fetch Response (Version: 16) => throttle_time_ms error_code session_id [responses] TAG_BUFFER
+//
+//	throttle_time_ms => INT32
+//	error_code => INT16
+//	session_id => INT32
+//	responses => topic_id [partitions] TAG_BUFFER
+//	  topic_id => UUID
+//	  partitions => partition_index error_code high_watermark last_stable_offset log_start_offset [aborted_transactions] preferred_read_replica records TAG_BUFFER
+//	    partition_index => INT32
+//	    error_code => INT16
+//	    high_watermark => INT64
+//	    last_stable_offset => INT64
+//	    log_start_offset => INT64
+//	    aborted_transactions => producer_id first_offset TAG_BUFFER
+//	      producer_id => INT64
+//	      first_offset => INT64
+//	    preferred_read_replica => INT32
+//	    records => COMPACT_RECORDS
+func (conn *KafkaConn) HandleFetchRequest(ctx context.Context, req *Request) error {
+	errCode := req.Validate()
+	sessionId := int32(0)
+	numResponses := int8(0)
+	err := WriteMany(
+		conn.buf, req.CorrelationId, TagBuffer, ThrottleTimeMock, errCode, sessionId, numResponses, TagBuffer,
+	)
+	if err != nil {
+		return err
 	}
 
-	return nil
+	return conn.Flush()
 }
 
 func (conn *KafkaConn) Handle(ctx context.Context) error {
-	req, err := conn.Request(ctx)
+	req, err := conn.ParseRequest(ctx)
 	if err != nil {
 		return nil
 	}
 
-	resp := NewKafkaResponse(req.CorrelationId, req.Validate(), []ApiKey{Fetch, ApiVersions}, 0)
-	if err := conn.Response(ctx, resp); err != nil {
-		return err
+	switch req.ApiKey {
+	case ApiKeyFetch:
+		return conn.HandleFetchRequest(ctx, req)
+	case ApiKeyApiVersions:
+		return conn.HandleApiVersionsRequest(ctx, req)
+	default:
+		return fmt.Errorf("%w: %d", ErrUnsupportedApiKey, req.ApiKey)
 	}
-
-	return nil
 }
 
 func (conn *KafkaConn) HandleLoop(ctx context.Context) error {
