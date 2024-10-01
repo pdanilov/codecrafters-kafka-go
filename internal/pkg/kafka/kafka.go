@@ -15,7 +15,7 @@ import (
 )
 
 var (
-	ErrUnsupportedApiKey = errors.New("Unsupported api key")
+	ErrUnsupportedApiKey = errors.New("Unsupported API key")
 )
 
 const (
@@ -44,7 +44,6 @@ func NewKafkaConn(conn net.Conn) *KafkaConn {
 }
 
 func (conn *KafkaConn) Flush() error {
-	defer conn.buf.Reset()
 	return WriteMany(conn, int32(conn.buf.Len()), conn.buf.Bytes())
 }
 
@@ -94,6 +93,7 @@ func (conn *KafkaConn) ParseRequest(ctx context.Context) (*Request, error) {
 // throttle_time_ms => INT32
 // _tagged_fields
 func (conn *KafkaConn) HandleApiVersionsRequest(ctx context.Context, req *Request) error {
+	defer conn.buf.Reset()
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetWriteDeadline(deadline); err != nil {
 			return err
@@ -102,7 +102,7 @@ func (conn *KafkaConn) HandleApiVersionsRequest(ctx context.Context, req *Reques
 
 	errCode := req.Validate()
 	apiKeys := []ApiKey{ApiKeyFetch, ApiKeyApiVersions}
-	numOfApiKeys := int8(len(apiKeys) + 1)
+	numOfApiKeys := int8(len(apiKeys) + 1) // TODO: understand why should we use +1
 	if err := WriteMany(conn.buf, req.CorrelationId, errCode, numOfApiKeys); err != nil {
 		return err
 	}
@@ -144,6 +144,7 @@ func (conn *KafkaConn) HandleApiVersionsRequest(ctx context.Context, req *Reques
 //	    preferred_read_replica => INT32
 //	    records => COMPACT_RECORDS
 func (conn *KafkaConn) HandleFetchRequest(ctx context.Context, req *Request) error {
+	defer conn.buf.Reset()
 	errCode := req.Validate()
 	sessionId := int32(0)
 	numResponses := int8(0)
